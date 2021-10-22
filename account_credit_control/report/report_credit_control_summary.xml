@@ -10,7 +10,7 @@
                 />
             </t>
             <div class="page">
-                <h2 id="policy_level">
+                <h2 class="row mt32" id="policy_level">
                     <span t-field="doc.policy_level_id.name" />
                 </h2>
                 <div id="informations" class="row mt32 mb32">
@@ -24,7 +24,7 @@
                         <span t-field="doc.policy_level_id.custom_text" />
                     </div>
                 </div>
-                <h3>Summary</h3>
+<!--                <h3>Summary</h3>-->
                 <table class="table table-sm" id="summary_table">
                     <thead>
                         <tr>
