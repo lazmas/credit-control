@@ -120,6 +120,7 @@ class OverdueReminderStart(models.TransientModel):
 
     def run(self):
         self.ensure_one()
+        reminder_cron_execution = self.env.context.get("reminder_cron_execution", False)
         if not self.up_to_date:
             raise UserError(
                 _(
@@ -180,7 +181,10 @@ class OverdueReminderStart(models.TransientModel):
                 action = orso.create(vals)
                 action_ids.append(action.id)
         if not action_ids:
-            raise UserError(_("There are no overdue reminders."))
+            if reminder_cron_execution:
+                return False
+            else:
+                raise UserError(_("There are no overdue reminders."))
         if self.interface == "onebyone":
             xid = MOD + ".overdue_reminder_step_onebyone_action"
             action = self.env.ref(xid).sudo().read()[0]
@@ -456,12 +460,10 @@ class OverdueReminderStep(models.TransientModel):
     def check_warnings(self):
         self.ensure_one()
         for rec in self:
-            if rec.company_id != self.env.company:
+            if rec.company_id not in self.env.companies:
                 raise UserError(
-                    _(
-                        "User company is different from action company. "
-                        "This should never happen."
-                    )
+                    _("The user is not allowed to access company %s")
+                    % rec.company_id.name
                 )
             if (
                 rec.warn_unreconciled_move_line_ids
@@ -482,11 +484,13 @@ class OverdueReminderStep(models.TransientModel):
     def validate(self):
         orao = self.env["overdue.reminder.action"]
         mao = self.env["mail.activity"]
-        self.check_warnings()
+        reminder_cron_execution = self.env.context.get("reminder_cron_execution", False)
+        if not reminder_cron_execution:
+            self.check_warnings()
         for rec in self:
             vals = {}
-            if rec.reminder_type == "mail":
-                vals = rec.validate_mail()
+            if rec.reminder_type == "mail" and rec.validate_mail():
+                vals = rec.generate_mail_vals()
             elif rec.reminder_type == "phone":
                 vals = rec.validate_phone()
             elif rec.reminder_type == "post":
@@ -506,9 +510,34 @@ class OverdueReminderStep(models.TransientModel):
     def _get_overdue_invoice_reminder_template(self):
         return MOD + ".overdue_invoice_reminder_mail_template"
 
+    def _get_attachment_ids(self, inv_report, mail):
+        attachment_ids = []
+        iao = self.env["ir.attachment"]
+        for inv in self.invoice_ids:
+            if inv_report.report_type in ("qweb-html", "qweb-pdf"):
+                report_bin, report_format = inv_report.render_qweb_pdf([inv.id])
+            else:
+                res = inv_report.render([inv.id])
+                if not res:
+                    raise UserError(
+                        _("Report format '%s' is not supported.")
+                        % inv_report.report_type
+                    )
+                report_bin, report_format = res
+            filename = "{}.{}".format(inv._get_report_base_filename(), report_format)
+            attach = iao.create(
+                {
+                    "name": filename,
+                    "datas": base64.b64encode(report_bin),
+                    "res_model": "mail.message",
+                    "res_id": mail.mail_message_id.id,
+                }
+            )
+            attachment_ids.append(attach.id)
+        return attachment_ids
+
     def validate_mail(self):
         self.ensure_one()
-        iao = self.env["ir.attachment"]
         if not self.partner_id.email:
             raise UserError(
                 _("E-mail missing on partner '%s'.") % self.partner_id.display_name
@@ -517,6 +546,10 @@ class OverdueReminderStep(models.TransientModel):
             raise UserError(_("Mail subject is empty."))
         if not self.mail_body:
             raise UserError(_("Mail body is empty."))
+        return True
+
+    def generate_mail_vals(self):
+        self.ensure_one()
         xmlid = self._get_overdue_invoice_reminder_template()
         mvals = self.env.ref(xmlid).generate_email(
             self.id, ["email_from", "email_to", "partner_to", "reply_to"]
@@ -524,6 +557,8 @@ class OverdueReminderStep(models.TransientModel):
         cc_list = [p.email for p in self.mail_cc_partner_ids if p.email]
         if mvals.get("email_cc"):
             cc_list.append(mvals["email_cc"])
+        if mvals.get("partner_ids"):
+            mvals["recipient_ids"] = mvals.pop("partner_ids")
         mvals.update(
             {
                 "subject": self.mail_subject,
@@ -541,30 +576,7 @@ class OverdueReminderStep(models.TransientModel):
             "account.report_invoice_with_payments"
         )
         if self.company_id.overdue_reminder_attach_invoice:
-            attachment_ids = []
-            for inv in self.invoice_ids:
-                if inv_report.report_type in ("qweb-html", "qweb-pdf"):
-                    report_bin, report_format = inv_report.render_qweb_pdf([inv.id])
-                else:
-                    res = inv_report.render([inv.id])
-                    if not res:
-                        raise UserError(
-                            _("Report format '%s' is not supported.")
-                            % inv_report.report_type
-                        )
-                    report_bin, report_format = res
-                filename = "{}.{}".format(
-                    inv._get_report_base_filename(), report_format
-                )
-                attach = iao.create(
-                    {
-                        "name": filename,
-                        "datas": base64.b64encode(report_bin),
-                        "res_model": "mail.message",
-                        "res_id": mail.mail_message_id.id,
-                    }
-                )
-                attachment_ids.append(attach.id)
+            attachment_ids = self._get_attachment_ids(inv_report, mail)
             mail.write({"attachment_ids": [(6, 0, attachment_ids)]})
         vals = {"mail_id": mail.id}
         return vals
@@ -603,7 +615,9 @@ class OverdueReminderStep(models.TransientModel):
             vals["reminder_ids"].append((0, 0, rvals))
 
     def print_letter(self):
-        self.check_warnings()
+        reminder_cron_execution = self.env.context.get("reminder_cron_execution", False)
+        if not reminder_cron_execution:
+            self.check_warnings()
         self.write({"letter_printed": True})
         action = action = (
             self.env.ref(MOD + ".overdue_reminder_step_report")
